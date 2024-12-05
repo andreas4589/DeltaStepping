@@ -38,8 +38,10 @@ import qualified Data.Graph.Inductive                               as G
 import qualified Data.IntMap.Strict                                 as Map
 import qualified Data.IntSet                                        as Set
 import qualified Data.Vector.Mutable                                as V
-import qualified Data.Vector.Storable                               as M ( unsafeFreeze )
+import qualified Data.Vector.Storable                               as S ( unsafeFreeze, replicate )
 import qualified Data.Vector.Storable.Mutable                       as M
+import qualified Data.Graph.Inductive.Internal.Heap as Data.IntSet
+import Data.Primitive (emptyArray)
 
 
 type Graph    = Gr String Distance  -- Graphs have nodes labelled with Strings and edges labelled with their distance
@@ -93,7 +95,7 @@ deltaStepping verbose graph delta source = do
   -- NOTE: The function 'Data.Vector.convert' can be used to translate between
   -- different (compatible) vector types (e.g. boxed to storable)
   --
-  M.unsafeFreeze distances
+  S.unsafeFreeze distances
 
 -- Initialise algorithm state
 --
@@ -103,7 +105,17 @@ initialise
     -> Node
     -> IO (Buckets, TentativeDistances)
 initialise graph delta source = do
-  undefined
+  let numNodes = length $ G.nodes graph
+  tentativeDistances <- M.replicate numNodes infinity
+  M.write tentativeDistances source 0
+
+  let numBuckets = max 1 (ceiling (fromIntegral numNodes / delta))
+  bucketArray <- V.replicate numBuckets Set.empty
+  let sourceBucket = 0
+  V.modify bucketArray (Set.insert source) sourceBucket
+  firstBucket <- newIORef sourceBucket
+
+  return (Buckets firstBucket bucketArray, tentativeDistances)
 
 
 -- Take a single step of the algorithm.
