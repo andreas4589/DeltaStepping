@@ -144,9 +144,13 @@ step verbose threadCount graph delta buckets distances = do
 -- algorithm terminates.
 --
 allBucketsEmpty :: Buckets -> IO Bool
-allBucketsEmpty buckets = do
-  undefined
-
+allBucketsEmpty Buckets{..} = do
+   let numBuckets = V.length bucketArray
+   foldM
+     (\ acc idx
+        -> do bucket <- V.read bucketArray idx
+              return $ acc && Set.null bucket)
+     True [0 .. numBuckets - 1]
 
 -- Return the index of the smallest on-empty bucket. Assumes that there is at
 -- least one non-empty bucket remaining.
