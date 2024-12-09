@@ -152,12 +152,19 @@ allBucketsEmpty Buckets{..} = do
               return $ acc && Set.null bucket)
      True [0 .. numBuckets - 1]
 
--- Return the index of the smallest on-empty bucket. Assumes that there is at
+-- Return the index of the smallest non-empty bucket. Assumes that there is at
 -- least one non-empty bucket remaining.
 --
 findNextBucket :: Buckets -> IO Int
 findNextBucket buckets = do
-  undefined
+  let numBuckets = V.length (bucketArray buckets)
+  go 0
+  where
+    go index = do
+      bucket <- V.read (bucketArray buckets) index
+      if Set.null bucket
+        then go (index + 1)
+        else return index
 
 
 -- Create requests of (node, distance) pairs that fulfil the given predicate
@@ -320,4 +327,5 @@ printBucket graph bucket distances = do
       Just l  -> printf "  %4d  |  %5v  |  %f\n" v l x
   --
   printf "\n"
+
 
