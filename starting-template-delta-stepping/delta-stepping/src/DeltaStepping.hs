@@ -42,6 +42,7 @@ import qualified Data.Vector.Storable                               as S ( unsaf
 import qualified Data.Vector.Storable.Mutable                       as M
 import qualified Data.Graph.Inductive.Internal.Heap as Data.IntSet
 import Data.Primitive (emptyArray)
+import qualified Data.IntMap as IntMap
 
 
 type Graph    = Gr String Distance  -- Graphs have nodes labelled with Strings and edges labelled with their distance
@@ -190,8 +191,10 @@ relaxRequests
     -> IntMap Distance
     -> IO ()
 relaxRequests threadCount buckets distances delta req = do
-  undefined
-
+  IntMap.foldrWithKey
+    (\node newDistance acc -> acc >> relax buckets distances delta (node, newDistance))
+    (return ())
+    req
 
 -- Execute a single relaxation, moving the given node to the appropriate bucket
 -- as necessary
