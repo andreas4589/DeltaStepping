@@ -202,7 +202,21 @@ relax :: Buckets
       -> (Node, Distance) -- (w, x) in the paper
       -> IO ()
 relax buckets distances delta (node, newDistance) = do
-  undefined
+  oldDistance <- M.read distances node
+  when (newDistance < oldDistance) $ do -- (* Insert or move w in B if x < tent(w) *)
+    let oldIndex = floor (oldDistance / delta)
+        newIndex = floor (newDistance / delta)
+        bArray   = bucketArray buckets
+    
+    oldBucket <- V.read bArray oldIndex -- (* If in, remove from old bucket *)
+    let updatedBucket = Set.delete node oldBucket
+    V.write bArray oldIndex updatedBucket
+    
+    newBucket <- V.read bArray newIndex -- (* Insert into new bucket *)
+    let updatedBucket2 = Set.insert node newBucket
+    V.write bArray newIndex updatedBucket2
+
+    M.write distances node newDistance  -- tent(w) := x
 
 
 -- -----------------------------------------------------------------------------
