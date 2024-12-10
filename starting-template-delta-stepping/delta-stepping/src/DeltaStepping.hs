@@ -131,15 +131,28 @@ step
     -> TentativeDistances
     -> IO ()
 step verbose threadCount graph delta buckets distances = do
-  -- In this function, you need to implement the body of the outer while loop,
-  -- which contains another while loop.
-  -- See function 'deltaStepping' for inspiration on implementing a while loop
-  -- in a functional language.
-  -- For debugging purposes, you may want to place:
-  --   printVerbose verbose "inner step" graph delta buckets distances
-  -- in the inner loop.
-  undefined
+  i <- findNextBucket buckets -- (* Smallest nonempty bucket *)
+  r <- newIORef Set.empty     -- (* No nodes deleted for bucket B[i] yet *)
 
+  let
+    loop = do                 -- (* New phase *)
+      bucket <- V.read (bucketArray buckets) i  
+      let done = Set.null bucket
+
+      if done then return ()
+      else do
+        printVerbose verbose "inner step" graph delta buckets distances
+        req <- findRequests threadCount (<= delta) graph bucket distances -- (* Create requests for light edges *)
+        rCon <- readIORef r
+        writeIORef r (Set.union bucket rCon)                                 -- (* Remember deleted nodes *)
+        V.write (bucketArray buckets) i Set.empty                         -- (* Current bucket empty *)
+        relaxRequests threadCount buckets distances delta req             -- (* Do relaxations, nodes may (re)enter B[i] *)
+        loop
+  loop
+
+  rCon <- readIORef r 
+  req <- findRequests threadCount (> delta) graph rCon distances   -- (* Create requests for heavy edges *)
+  relaxRequests threadCount buckets distances delta req         -- (* Relaxations will not refill B[i] *)
 
 -- Once all buckets are empty, the tentative distances are finalised and the
 -- algorithm terminates.
@@ -158,7 +171,6 @@ allBucketsEmpty Buckets{..} = do
 --
 findNextBucket :: Buckets -> IO Int
 findNextBucket buckets = do
-  let numBuckets = V.length (bucketArray buckets)
   go 0
   where
     go index = do
@@ -178,7 +190,26 @@ findRequests
     -> TentativeDistances
     -> IO (IntMap Distance)
 findRequests threadCount p graph v' distances = do
-  undefined
+  -- Fold over the set of nodes to build the request map
+  foldM processNode IntMap.empty (Set.toList v')
+  where
+    -- Process a single node and accumulate requests
+    processNode acc v = do
+      let edges = G.out graph v -- Outgoing edges of node v
+
+      -- Fold over edges to update the map
+      foldM (processEdge v) acc edges
+
+    -- Process a single edge and add to the map if it meets the predicate
+    processEdge v acc (_, w, c) = do
+      -- Calculate the new distance: tent(v) + c(v, w)
+      tentV <- M.read distances v
+      let newDistance = tentV + c
+
+      -- Check if the distance meets the predicate
+      if p newDistance
+        then return $ IntMap.insert w newDistance acc
+        else return acc
 
 
 -- Execute requests for each of the given (node, distance) pairs
