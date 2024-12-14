@@ -190,7 +190,29 @@ findRequests
     -> TentativeDistances
     -> IO (IntMap Distance)
 findRequests threadCount p graph nodes distances = do
-    undefined
+  -- Start with an empty IntMap to store the requests
+  let initialRequests = IntMap.empty
+
+  -- Fold over all nodes in the set
+  Set.foldr
+      (\v accIO -> do
+          -- Process the accumulator from the previous fold
+          acc <- accIO
+          
+          -- Get the tentative distance for the current node v
+          tentV <- M.read distances v
+
+          -- Get all neighbors of v that satisfy the predicate p
+          let neighbors = filter (\(_, _, cost) -> p cost) (G.out graph v)
+          print neighbors
+          let newRequests = map (\(_,w,cost) -> (w, tentV + cost)) neighbors
+          --print (IntMap.toList newRequests)
+          -- Merge the new requests into the accumulator
+          --return $ IntMap.union acc newRequests
+          return $ foldr (uncurry IntMap.insert) acc newRequests
+      )
+      (return initialRequests)
+      nodes  
    
 -- Execute requests for each of the given (node, distance) pairs
 --
@@ -211,7 +233,6 @@ relaxRequests threadCount buckets distances delta req = do
       )
       (return ()) -- Initial accumulator action
       req
-
     
 
 -- Execute a single relaxation, moving the given node to the appropriate bucket
