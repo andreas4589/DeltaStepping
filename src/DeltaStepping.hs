@@ -29,7 +29,7 @@ import Data.Graph.Inductive                                         ( Gr )
 import Data.IORef
 import Data.IntMap.Strict                                           ( IntMap )
 import Data.IntSet                                                  ( IntSet )
-import Data.Vector.Storable                                         ( Vector )
+import Data.Vector.Storable                                         ( Vector, maximumBy )
 import Data.Word
 import Foreign.Ptr
 import Foreign.Storable
@@ -106,17 +106,18 @@ initialise
     -> Node
     -> IO (Buckets, TentativeDistances)
 initialise graph delta source = do
-  let numNodes = length $ G.nodes graph
+  let numNodes = G.order graph
   tentativeDistances <- M.replicate numNodes infinity
   M.write tentativeDistances source 0
-
-  let numBuckets = max 1 (ceiling (fromIntegral numNodes / delta))
+  let maxEdge = maximum [dist | (_, _, dist) <- G.labEdges graph]
+  let numBuckets = ceiling (maxEdge / delta)
   bucketArray <- V.replicate numBuckets Set.empty
   let sourceBucket = 0
   V.modify bucketArray (Set.insert source) sourceBucket
   firstBucket <- newIORef sourceBucket
 
   return (Buckets firstBucket bucketArray, tentativeDistances)
+
 
 
 -- Take a single step of the algorithm.
@@ -154,6 +155,28 @@ step verbose threadCount graph delta buckets distances = do
   req <- findRequests threadCount (> delta) graph rCon distances   -- (* Create requests for heavy edges *)
   relaxRequests threadCount buckets distances delta req            -- (* Relaxations will not refill B[i] *)
 
+testStep = do
+  let graph = sample1
+      delta = 5
+      source = 3
+      threadCount = 1
+      verbose = False
+
+  -- Initializing Buckets and TentativeDistances
+  (buckets, distances) <- initialise graph delta source
+
+  -- Call the step function
+  step verbose threadCount graph delta buckets distances
+
+  -- Add assertions to verify the expected changes, such as:
+  -- Checking if the tentative distances were updated correctly.
+  dist <- M.read distances source
+  print (dist == 0)
+
+  -- Verify the buckets are modified correctly (or not)
+  firstBucketIdx <- readIORef (firstBucket buckets)
+  print (firstBucketIdx == 0)
+  
 -- Once all buckets are empty, the tentative distances are finalised and the
 -- algorithm terminates.
 --
@@ -237,17 +260,18 @@ relax :: Buckets
 relax buckets distances delta (node, newDistance) = do
   oldDistance <- M.read distances node
   when (newDistance < oldDistance) $ do -- (* Insert or move w in B if x < tent(w) *)
-    let oldIndex = floor (oldDistance / delta)
+    let l =  V.length (bucketArray buckets)
+        oldIndex = floor (oldDistance / delta)
         newIndex = floor (newDistance / delta)
         bArray   = bucketArray buckets
     
-    oldBucket <- V.read bArray oldIndex -- (* If in, remove from old bucket *)
+    oldBucket <- V.read bArray (oldIndex `mod` l) -- (* If in, remove from old bucket *)
     let updatedBucket = Set.delete node oldBucket
-    V.write bArray oldIndex updatedBucket 
-    
-    newBucket <- V.read bArray newIndex -- (* Insert into new bucket *)
+    V.write bArray (oldIndex `mod` l) updatedBucket 
+
+    newBucket <- V.read bArray (newIndex `mod` l) -- (* Insert into new bucket *)
     let updatedBucket2 = Set.insert node newBucket
-    V.write bArray newIndex updatedBucket2
+    V.write bArray (newIndex `mod` l) updatedBucket2
 
     M.write distances node newDistance  -- tent(w) := x
 
