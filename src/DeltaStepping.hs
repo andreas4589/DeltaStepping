@@ -202,10 +202,15 @@ relaxRequests
     -> IntMap Distance
     -> IO ()
 relaxRequests threadCount buckets distances delta req = do
+  -- Fold through all requests, relaxing each (node, newDistance) pair.
   IntMap.foldrWithKey
-    (\node newDistance acc -> acc >> relax buckets distances delta (node, newDistance))
-    (return ())
-    req
+      (\node newDistance acc -> do
+          acc
+          -- Call relax to process this node
+          relax buckets distances delta (node, newDistance)
+      )
+      (return ()) -- Initial accumulator action
+      req
 
     
 
@@ -226,7 +231,7 @@ relax buckets distances delta (node, newDistance) = do
     
     oldBucket <- V.read bArray oldIndex -- (* If in, remove from old bucket *)
     let updatedBucket = Set.delete node oldBucket
-    V.write bArray oldIndex updatedBucket
+    V.write bArray oldIndex updatedBucket 
     
     newBucket <- V.read bArray newIndex -- (* Insert into new bucket *)
     let updatedBucket2 = Set.insert node newBucket
