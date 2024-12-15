@@ -109,10 +109,12 @@ initialise graph delta source = do
   let numNodes = G.order graph
   tentativeDistances <- M.replicate numNodes infinity
   M.write tentativeDistances source 0
-  let maxEdge = maximum [dist | (_, _, dist) <- G.labEdges graph]
+  
+  let maxEdge = maximum [dist | (_, _, dist) <- G.labEdges graph] -- Look up the maximum edge to decide the #buckets
   let numBuckets = ceiling (maxEdge / delta)
   bucketArray <- V.replicate numBuckets Set.empty
   let sourceBucket = 0
+
   V.modify bucketArray (Set.insert source) sourceBucket
   firstBucket <- newIORef sourceBucket
 
@@ -155,27 +157,6 @@ step verbose threadCount graph delta buckets distances = do
   req <- findRequests threadCount (> delta) graph rCon distances   -- (* Create requests for heavy edges *)
   relaxRequests threadCount buckets distances delta req            -- (* Relaxations will not refill B[i] *)
 
-testStep = do
-  let graph = sample1
-      delta = 5
-      source = 3
-      threadCount = 1
-      verbose = False
-
-  -- Initializing Buckets and TentativeDistances
-  (buckets, distances) <- initialise graph delta source
-
-  -- Call the step function
-  step verbose threadCount graph delta buckets distances
-
-  -- Add assertions to verify the expected changes, such as:
-  -- Checking if the tentative distances were updated correctly.
-  dist <- M.read distances source
-  print (dist == 0)
-
-  -- Verify the buckets are modified correctly (or not)
-  firstBucketIdx <- readIORef (firstBucket buckets)
-  print (firstBucketIdx == 0)
   
 -- Once all buckets are empty, the tentative distances are finalised and the
 -- algorithm terminates.
@@ -223,12 +204,20 @@ findRequests threadCount p graph nodes distances = do
           tentV <- M.read distances v
 
           let neighbors = filter (\(_, _, cost) -> p cost) (G.out graph v)
-              newRequests = map (\(_,w,cost) -> (w, tentV + cost)) neighbors
+          let newRequests = map (\(_,w,cost) -> (w, tentV + cost)) neighbors
           
-          return $ foldr (uncurry IntMap.insert) acc newRequests
+          --return $ foldr (uncurry IntMap.insert) acc newRequests
+          return $ foldr insertIfLower acc newRequests
       )
       (return initialRequests)
-      nodes  
+      nodes 
+
+-- Insert only if the new cost is less than the existing one
+insertIfLower :: (Node, Distance) -> IntMap Distance -> IntMap Distance
+insertIfLower (key, newCost) acc =
+    case IntMap.lookup key acc of
+        Just oldCost | oldCost <= newCost -> acc -- Keep the old cost
+        _                                 -> IntMap.insert key newCost acc -- Insert the new cost 
    
 -- Execute requests for each of the given (node, distance) pairs
 --
@@ -261,17 +250,17 @@ relax buckets distances delta (node, newDistance) = do
   oldDistance <- M.read distances node
   when (newDistance < oldDistance) $ do -- (* Insert or move w in B if x < tent(w) *)
     let l =  V.length (bucketArray buckets)
-        oldIndex = floor (oldDistance / delta)
-        newIndex = floor (newDistance / delta)
+        oldIndex = floor (oldDistance / delta) `mod` l
+        newIndex = floor (newDistance / delta) `mod` l
         bArray   = bucketArray buckets
     
-    oldBucket <- V.read bArray (oldIndex `mod` l) -- (* If in, remove from old bucket *)
+    oldBucket <- V.read bArray oldIndex -- (* If in, remove from old bucket *)
     let updatedBucket = Set.delete node oldBucket
-    V.write bArray (oldIndex `mod` l) updatedBucket 
+    V.write bArray oldIndex updatedBucket 
 
-    newBucket <- V.read bArray (newIndex `mod` l) -- (* Insert into new bucket *)
+    newBucket <- V.read bArray newIndex -- (* Insert into new bucket *)
     let updatedBucket2 = Set.insert node newBucket
-    V.write bArray (newIndex `mod` l) updatedBucket2
+    V.write bArray newIndex updatedBucket2
 
     M.write distances node newDistance  -- tent(w) := x
 
