@@ -73,7 +73,7 @@ deltaStepping verbose graph delta source = do
 
   -- Initialise the algorithm
   (buckets, distances)  <- initialise graph delta source
-  printVerbose verbose "initialse" graph delta buckets distances
+  --printVerbose verbose "initialse" graph delta buckets distances
 
   let
     -- The algorithm loops while there are still non-empty buckets
@@ -82,12 +82,13 @@ deltaStepping verbose graph delta source = do
       if done
       then return ()
       else do
-        printVerbose verbose "result" graph delta buckets distances
+        --printVerbose verbose "result" graph delta buckets distances
         step verbose threadCount graph delta buckets distances
         loop
   loop
 
-  printVerbose verbose "result" graph delta buckets distances
+  --printVerbose verbose "result" graph delta buckets distances
+
   -- Once the tentative distances are finalised, convert into an immutable array
   -- to prevent further updates. It is safe to use this "unsafe" function here
   -- because the mutable vector will not be used any more, so referential
@@ -134,29 +135,28 @@ step
     -> TentativeDistances
     -> IO ()
 step verbose threadCount graph delta buckets distances = do
-  i <- findNextBucket buckets -- (* Smallest nonempty bucket *)
-  r <- newIORef Set.empty     -- (* No nodes deleted for bucket B[i] yet *)
+  i <- findNextBucket buckets
+  r <- newIORef Set.empty
 
   let
-    loop = do                 -- (* New phase *)
-      bucket <- V.read (bucketArray buckets) i  
+    loop = do
+      bucket <- V.read (bucketArray buckets) i
       let done = Set.null bucket
-
-      if done then return ()
-      else do
-        printVerbose verbose "inner step" graph delta buckets distances
-        req <- findRequests threadCount (<= delta) graph bucket distances -- (* Create requests for light edges *)
-        rCon <- readIORef r
-        writeIORef r (Set.union bucket rCon)                              -- (* Remember deleted nodes *)
-        V.write (bucketArray buckets) i Set.empty                         -- (* Current bucket empty *)
-        relaxRequests threadCount buckets distances delta req             -- (* Do relaxations, nodes may (re)enter B[i] *)
-        loop
+      if done
+        then return ()
+        else do
+          --printVerbose verbose "inner step" graph delta buckets distances
+          req <- findRequests threadCount (<= delta) graph bucket distances
+          rCon <- readIORef r
+          writeIORef r (Set.union bucket rCon)
+          V.write (bucketArray buckets) i Set.empty
+          relaxRequests threadCount buckets distances delta req
+          loop
   loop
 
-  rCon <- readIORef r 
-  req <- findRequests threadCount (> delta) graph rCon distances   -- (* Create requests for heavy edges *)
-  relaxRequests threadCount buckets distances delta req            -- (* Relaxations will not refill B[i] *)
-
+  rCon <- readIORef r
+  req <- findRequests threadCount (> delta) graph rCon distances
+  relaxRequests threadCount buckets distances delta req
   
 -- Once all buckets are empty, the tentative distances are finalised and the
 -- algorithm terminates.
@@ -194,23 +194,32 @@ findRequests
     -> TentativeDistances
     -> IO (IntMap Distance)
 findRequests threadCount p graph nodes distances = do
-  -- Start with an empty IntMap to store the requests
-  let initialRequests = IntMap.empty
+  let nodeList = Set.toList nodes
+  results <- newMVar Map.empty
 
-  -- Fold over all nodes in the set
-  Set.foldr
-      (\v accIO -> do
-          acc <- accIO
-          tentV <- M.read distances v
+  -- Use forkThreads to process nodes in parallel
+  forkThreads threadCount $ \threadID -> do
+    let chunk = chunkList threadCount threadID nodeList
+    forM_ chunk $ \v -> processNode p graph distances v results
 
-          let neighbors = filter (\(_, _, cost) -> p cost) (G.out graph v)
-          let newRequests = map (\(_,w,cost) -> (w, tentV + cost)) neighbors
-          
-          --return $ foldr (uncurry IntMap.insert) acc newRequests
-          return $ foldr insertIfLower acc newRequests
-      )
-      (return initialRequests)
-      nodes 
+  -- Return the final results after all threads complete
+  readMVar results
+
+-- Process a single node for finding requests
+processNode
+    :: (Distance -> Bool)   
+    -> Graph                
+    -> TentativeDistances  
+    -> Node                 
+    -> MVar (IntMap Distance) 
+    -> IO ()               
+processNode p graph distances v results = do
+  tentV <- M.read distances v  
+  let neighbors = filter (\(_, _, cost) -> p cost) (G.out graph v)
+  let newRequests = map (\(_, w, cost) -> (w, tentV + cost)) neighbors
+
+  -- Modify the results MVar by inserting the new requests
+  modifyMVar_ results $ \acc -> return $ foldr insertIfLower acc newRequests
 
 -- Insert only if the new cost is less than the existing one
 insertIfLower :: (Node, Distance) -> IntMap Distance -> IntMap Distance
@@ -229,14 +238,19 @@ relaxRequests
     -> IntMap Distance
     -> IO ()
 relaxRequests threadCount buckets distances delta req = do
-  IntMap.foldrWithKey
-      (\node newDistance acc -> do
-          acc
-          relax buckets distances delta (node, newDistance)
-      )
-      (return ()) 
-      req
-    
+  let reqList = IntMap.toList req
+  forkThreads threadCount $ \threadID -> do
+    let chunk = chunkList threadCount threadID reqList
+    forM_ chunk $ \(node, newDistance) ->
+      relax buckets distances delta (node, newDistance)
+
+-- Helper: Divide a list into chunks for parallel processing
+chunkList :: Int -> Int -> [a] -> [a]
+chunkList numChunks chunkID xs =
+  let (chunkSize, remainder) = length xs `quotRem` numChunks
+      start = chunkID * chunkSize + min chunkID remainder
+      end = start + chunkSize + if chunkID < remainder then 1 else 0
+  in take (end - start) (drop start xs) 
 
 -- Execute a single relaxation, moving the given node to the appropriate bucket
 -- as necessary
