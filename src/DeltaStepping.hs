@@ -259,13 +259,13 @@ relaxRequests threadCount buckets distances delta req = do
     
 -- Function to split an IntMap into n parts
 splitIntMap :: Int -> IntMap a -> [IntMap a]
-splitIntMap n intmap
-    | n == 1    = [intmap]                                              -- If only one thread, return the entire map
-    | otherwise = take n (go n [intmap] ++ repeat Map.empty)
+splitIntMap n input = go (IntMap.toList input) n
   where
-    -- Recursive splitting of the IntMap
-    go 1 acc = acc                                                      -- Stop splitting when we have enough parts
-    go m acc = go (m - 1) (concatMap Map.splitRoot acc)
+    -- Helper function to recursively split the list of (key, value) pairs
+    go :: [(Int, a)] -> Int -> [IntMap a]
+    go _ 0 = []
+    go xs k = let (part, rest) = splitAt (length xs `div` k) xs
+              in IntMap.fromList part : go rest (k - 1)
 
 
 -- Execute a single relaxation, moving the given node to the appropriate bucket
