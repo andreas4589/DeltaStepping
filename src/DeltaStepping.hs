@@ -29,7 +29,7 @@ import Data.Graph.Inductive                                         ( Gr )
 import Data.IORef
 import Data.IntMap.Strict                                           ( IntMap )
 import Data.IntSet                                                  ( IntSet )
-import Data.Vector.Storable                                         ( Vector, maximumBy )
+import Data.Vector.Storable                                         ( Vector )
 import Data.Word
 import Foreign.Ptr
 import Foreign.Storable
@@ -39,7 +39,7 @@ import qualified Data.Graph.Inductive                               as G
 import qualified Data.IntMap.Strict                                 as Map
 import qualified Data.IntSet                                        as Set
 import qualified Data.Vector.Mutable                                as V
-import qualified Data.Vector.Storable                               as S ( unsafeFreeze, replicate )
+import qualified Data.Vector.Storable                               as S ( unsafeFreeze)
 import qualified Data.Vector.Storable.Mutable                       as M
 import qualified Data.Graph.Inductive.Internal.Heap as Data.IntSet
 import Data.Primitive (emptyArray)
@@ -63,20 +63,6 @@ type Distance = Float               -- Distances between nodes are (positive) fl
 -- is what the test suite expects), but you are free to change the types of all
 -- other functions and data structures in this module as you require.
 
-{-
-  bench
-    N1: OK
-      2.021 s ±  60 ms, 1.2 GB allocated, 273 MB copied, 853 MB peak memory
-    N2: FAIL
-      2.125 s ±  57 ms, 1.2 GB allocated, 273 MB copied, 853 MB peak memory, 1.05x
-      Use -p '/bench/&&/N2/' to rerun this test only.
-    N4: FAIL
-      2.160 s ± 125 ms, 1.2 GB allocated, 272 MB copied, 853 MB peak memory, 1.07x
-      Use -p '/bench/&&/N4/' to rerun this test only.
-    N8: FAIL
-      1.670 s ±  68 ms, 1.2 GB allocated, 273 MB copied, 853 MB peak memory, 0.83x
-      Use -p '/bench/&&/N8/' to rerun this test only.
--}
 
 deltaStepping
     :: Bool                             -- Whether to print intermediate states to the console, for debugging purposes
@@ -122,20 +108,19 @@ initialise
     -> Node
     -> IO (Buckets, TentativeDistances)
 initialise graph delta source = do
-  let numNodes = G.order graph
-  tentativeDistances <- M.replicate numNodes infinity
-  M.write tentativeDistances source 0
-  
-  let maxEdge = maximum [dist | (_, _, dist) <- G.labEdges graph] -- Look up the maximum edge to decide the #buckets
-  let numBuckets = ceiling (maxEdge / delta)
-  bucketArray <- V.replicate numBuckets Set.empty
-  let sourceBucket = 0
+  let numNodes   = G.order graph
+      maxEdge    = maximum [dist | (_, _, dist) <- G.labEdges graph] -- Look up the maximum edge to decide the #buckets
+      numBuckets = ceiling (maxEdge / delta)   
+      srcBucket  = 0
 
-  V.modify bucketArray (Set.insert source) sourceBucket
-  firstBucket <- newIORef sourceBucket
+  tentativeDistances <- M.replicate numNodes infinity                -- All vertices have infinite tentative distance, except s which has distance zero
+  M.write tentativeDistances source 0
+           
+  bucketArray <- V.replicate numBuckets Set.empty
+  V.modify bucketArray (Set.insert source) srcBucket           
+  firstBucket <- newIORef srcBucket                                  -- All buckets are empty, except B[0] which contains s
 
   return (Buckets firstBucket bucketArray, tentativeDistances)
-
 
 
 -- Take a single step of the algorithm.
@@ -150,11 +135,11 @@ step
     -> TentativeDistances
     -> IO ()
 step verbose threadCount graph delta buckets distances = do
-  i <- findNextBucket buckets -- (* Smallest nonempty bucket *)
-  r <- newIORef Set.empty     -- (* No nodes deleted for bucket B[i] yet *)
+  i <- findNextBucket buckets                                             -- (* Smallest nonempty bucket *)
+  r <- newIORef Set.empty                                                 -- (* No nodes deleted for bucket B[i] yet *)
 
   let
-    loop = do                 -- (* New phase *)
+    loop = do                                                             -- (* New phase *)
       bucket <- V.read (bucketArray buckets) i  
       let done = Set.null bucket
 
@@ -162,16 +147,15 @@ step verbose threadCount graph delta buckets distances = do
       else do
         printVerbose verbose "inner step" graph delta buckets distances
         req <- findRequests threadCount (<= delta) graph bucket distances -- (* Create requests for light edges *)
-        rCon <- readIORef r
-        writeIORef r (Set.union bucket rCon)                              -- (* Remember deleted nodes *)
+        modifyIORef' r (Set.union bucket)                                 -- (* Remember deleted nodes *)
         V.write (bucketArray buckets) i Set.empty                         -- (* Current bucket empty *)
         relaxRequests threadCount buckets distances delta req             -- (* Do relaxations, nodes may (re)enter B[i] *)
         loop
   loop
 
-  rCon <- readIORef r 
-  req <- findRequests threadCount (> delta) graph rCon distances   -- (* Create requests for heavy edges *)
-  relaxRequests threadCount buckets distances delta req            -- (* Relaxations will not refill B[i] *)
+  rContent <- readIORef r 
+  req <- findRequests threadCount (> delta) graph rContent distances      -- (* Create requests for heavy edges *)
+  relaxRequests threadCount buckets distances delta req                   -- (* Relaxations will not refill B[i] *)
 
   
 -- Once all buckets are empty, the tentative distances are finalised and the
@@ -181,9 +165,9 @@ allBucketsEmpty :: Buckets -> IO Bool
 allBucketsEmpty Buckets{..} = do
    let numBuckets = V.length bucketArray
    foldM
-     (\ acc idx
-        -> do bucket <- V.read bucketArray idx
-              return $ acc && Set.null bucket)
+     (\acc idx -> do 
+        bucket <- V.read bucketArray idx
+        return $ acc && Set.null bucket)
      True [0 .. numBuckets - 1]
 
 -- Return the index of the smallest non-empty bucket. Assumes that there is at
@@ -195,9 +179,8 @@ findNextBucket buckets = do
   where
     go index = do
       bucket <- V.read (bucketArray buckets) index
-      if Set.null bucket
-        then go (index + 1)
-        else return index
+      if Set.null bucket then go (index + 1)
+      else return index
 
 
 -- Create requests of (node, distance) pairs that fulfil the given predicate
@@ -210,96 +193,48 @@ findRequests
     -> TentativeDistances
     -> IO (IntMap Distance)
 findRequests threadCount p graph nodes distances = do
-  requests <- newMVar IntMap.empty  
-  let splitNodes = splitIntSet threadCount nodes 
+  let splitNodes = splitIntSet threadCount nodes                -- Split the IntSet of nodes in threadCount amount of IntSets 
+  localRequests <- replicateM threadCount (newIORef Map.empty)  -- Use thread-local maps for requests (Threadcount amount of IORefs containg empty IntMaps)
 
   forkThreads threadCount $ \threadId -> do
     let nodesI = splitNodes !! threadId
- 
-    mapM_ (\v -> do
-                tentV <- M.read distances v
 
-                let neighbors = filter (\(_, _, cost) -> p cost) (G.out graph v)
-                    newRequests = map (\(_, w, cost) -> (w, tentV + cost)) neighbors
+    Set.foldl'
+      (\accIO v -> do
+          accIO
+          tentV <- M.read distances v
 
-                modifyMVar_ requests $ \req -> return (foldr insertIfLower req newRequests))
-              (Set.toList nodesI)
-    
-  readMVar requests
+          let neighbors = filter (\(_, _, cost) -> p cost) (G.out graph v)
+              updates   = foldr (\(_, w, cost) reqMap ->                      -- Only insert in the map if the distance of key is 
+                insertIfLower (w, tentV + cost) reqMap) Map.empty neighbors   -- smaller than the original one
 
+          modifyIORef' (localRequests !! threadId) (\reqMap -> foldr insertIfLower reqMap (Map.toList updates)))
+      (return ())
+      nodesI
 
+  -- Merge all local maps into a single global map
+  foldM (\acc ref -> do
+           localMap <- readIORef ref
+           return $ foldr insertIfLower acc (Map.toList localMap))
+        Map.empty
+        localRequests
+
+-- Lookup the key in the map: if it is present, check if the newvalue is lower, then insert. If it is not present just insert.
 insertIfLower :: (Node, Distance) -> IntMap Distance -> IntMap Distance
 insertIfLower (key, newCost) acc =
-  case IntMap.lookup key acc of
-      Just oldCost | oldCost <= newCost -> acc -- Keep the old cost
-      _                                 -> IntMap.insert key newCost acc -- Insert the new cost
+  case Map.lookup key acc of
+      Just oldCost | oldCost <= newCost -> acc                        -- Keep the old cost
+      _                                 -> Map.insert key newCost acc -- Insert the new cost
 
-{-
--- Split an IntSet into n parts, ensuring sizes differ by at most 1
-splitIntSet :: IntSet -> Int -> [IntSet]
-splitIntSet set n = 
-  let elems = Set.toList set                    -- Convert IntSet to a sorted list
-      (q, r) = length elems `divMod` n          -- q = base size, r = remainder
-      sizes = replicate r (q + 1) ++ replicate (n - r) q -- Sizes for each chunk
-  in map Set.fromList $ splitBySizes sizes elems
-
--- Helper function to split a list into chunks of specified sizes
-splitBySizes :: [Int] -> [a] -> [[a]]
-splitBySizes [] _ = []
-splitBySizes (s:ss) xs = take s xs : splitBySizes ss (drop s xs)
--}
+-- Split an IntSet into n parts
 splitIntSet :: Int -> IntSet -> [IntSet]
-splitIntSet threadCount m
-    | threadCount <= 1 = [m]  -- If only one thread, return the entire map
-    | otherwise = take threadCount (go threadCount [m] ++ repeat Set.empty)
+splitIntSet n req
+    | n == 1    = [req]                                               -- If only one thread, return the entire set
+    | otherwise = take n (go n [req] ++ repeat Set.empty)
   where
-    -- Recursive splitting of the IntMap
-    go 1 acc = acc  -- Stop splitting when we have enough parts
-    go n acc = go (n - 1) (concatMap Set.splitRoot acc)
+    go 1 acc = acc                                                    -- Stop when threadCount is reduced to 1
+    go m acc = go (m `div` 2) (concatMap Set.splitRoot acc)           -- Divide the set in two with splitRoot
 
-{-
--- Insert only if the new cost is less than the existing one
-insertIfLower2 :: Ord k => (k, Distance) -> CMap k Distance -> STM (CMap k Distance)
-insertIfLower2 (key, newCost) acc = do
-  existingValue <- lookup2 key acc
-  case existingValue of
-      Just oldCost | oldCost <= newCost -> return acc  -- Keep the old cost if it's less than or equal
-      _ -> insert2 key newCost acc  -- Otherwise, insert the new cost
-        
-data CMap k v = CMap (TVar (MapNode k v))
-data MapNode k v
-  = Bin k (TVar v) (CMap k v) (CMap k v)
-  | Tip
-
-lookup2 :: Ord k => k -> CMap k v -> STM (Maybe v)
-lookup2 key (CMap ref) = readTVar ref >>= go
-  where
-    go Tip = return Nothing
-    go (Bin k v l r) =
-      case compare key k of
-      LT -> lookup2 key l
-      GT -> lookup2 key r
-      EQ -> Just <$> readTVar v
-
-insert2 :: Ord k => k -> v -> CMap k v -> STM(CMap k v)
-insert2 key value (CMap ref) = do
-  node <- readTVar ref
-  case node of
-    Tip -> do
-      v <- newTVar value
-      l <- newTVar Tip
-      r <- newTVar Tip
-      writeTVar ref (Bin key v (CMap l) (CMap r))
-      return $ CMap ref
-    (Bin k v l r) -> case compare key k of
-      LT -> insert2 key value l
-      GT -> insert2 key value r
-      EQ -> do
-        -- If key already exists, update the value in the node
-        writeTVar v value
-        return $ CMap ref
-  
--}
 
 -- Execute requests for each of the given (node, distance) pairs
 --
@@ -311,26 +246,26 @@ relaxRequests
     -> IntMap Distance
     -> IO ()
 relaxRequests threadCount buckets distances delta req = do
-  let splitReqs = splitIntMap threadCount req
+  let splitReqs = splitIntMap threadCount req                           -- Split the IntMap in threadCount amount of IntMaps
 
   forkThreads threadCount $ \threadId -> do
-    IntMap.foldrWithKey
+    Map.foldrWithKey
         (\node newDistance acc -> do
             acc
-            relax buckets distances delta (node, newDistance)
+            relax buckets distances delta (node, newDistance)           -- Relax alll the requests
         )
         (return ()) 
         (splitReqs !! threadId)
     
--- Function to split an IntMap into n parts (almost equal in size)
+-- Function to split an IntMap into n parts
 splitIntMap :: Int -> IntMap a -> [IntMap a]
-splitIntMap threadCount m
-    | threadCount <= 1 = [m]  -- If only one thread, return the entire map
-    | otherwise = take threadCount (go threadCount [m] ++ repeat IntMap.empty)
+splitIntMap n intmap
+    | n == 1    = [intmap]                                              -- If only one thread, return the entire map
+    | otherwise = take n (go n [intmap] ++ repeat Map.empty)
   where
     -- Recursive splitting of the IntMap
-    go 1 acc = acc  -- Stop splitting when we have enough parts
-    go n acc = go (n - 1) (concatMap IntMap.splitRoot acc)
+    go 1 acc = acc                                                      -- Stop splitting when we have enough parts
+    go m acc = go (m - 1) (concatMap Map.splitRoot acc)
 
 
 -- Execute a single relaxation, moving the given node to the appropriate bucket
@@ -343,21 +278,18 @@ relax :: Buckets
       -> IO ()
 relax buckets distances delta (node, newDistance) = do
   oldDistance <- M.read distances node
-  when (newDistance < oldDistance) $ do -- (* Insert or move w in B if x < tent(w) *)
-    let l =  V.length (bucketArray buckets)
-        oldIndex = floor (oldDistance / delta) `mod` l
-        newIndex = floor (newDistance / delta) `mod` l
-        bArray   = bucketArray buckets
+  when (newDistance < oldDistance) $ do                                 -- (* Insert or move w in B if x < tent(w) *)
+    let l         = V.length (bucketArray buckets)
+        oldIndex  = floor (oldDistance / delta) `mod` l                 -- Make use of the cyclic array
+        newIndex  = floor (newDistance / delta) `mod` l
+        bArray    = bucketArray buckets
     
-    oldBucket <- V.read bArray oldIndex -- (* If in, remove from old bucket *)
-    let updatedBucket = Set.delete node oldBucket
-    V.write bArray oldIndex updatedBucket 
+    atomicModifyIOVector bArray oldIndex $ \bucket -> (Set.delete node bucket, ())
+    atomicModifyIOVector bArray newIndex $ \bucket -> (Set.insert node bucket, ())
 
-    newBucket <- V.read bArray newIndex -- (* Insert into new bucket *)
-    let updatedBucket2 = Set.insert node newBucket
-    V.write bArray newIndex updatedBucket2
-
-    M.write distances node newDistance  -- tent(w) := x
+    -- Update tentative distance atomically
+    atomicModifyIOVectorFloat distances node $ \current ->
+      if newDistance < current then (newDistance, ()) else (current, ())
 
 -- -----------------------------------------------------------------------------
 -- Starting framework
