@@ -33,6 +33,7 @@ import Data.Vector.Storable                                         ( Vector, ma
 import Data.Word
 import Foreign.Ptr
 import Foreign.Storable
+import Control.Concurrent.STM
 import Text.Printf
 import qualified Data.Graph.Inductive                               as G
 import qualified Data.IntMap.Strict                                 as Map
@@ -61,7 +62,22 @@ type Distance = Float               -- Distances between nodes are (positive) fl
 -- NOTE: The type of the 'deltaStepping' function should not change (since that
 -- is what the test suite expects), but you are free to change the types of all
 -- other functions and data structures in this module as you require.
---
+
+{-
+  bench
+    N1: OK
+      2.021 s ±  60 ms, 1.2 GB allocated, 273 MB copied, 853 MB peak memory
+    N2: FAIL
+      2.125 s ±  57 ms, 1.2 GB allocated, 273 MB copied, 853 MB peak memory, 1.05x
+      Use -p '/bench/&&/N2/' to rerun this test only.
+    N4: FAIL
+      2.160 s ± 125 ms, 1.2 GB allocated, 272 MB copied, 853 MB peak memory, 1.07x
+      Use -p '/bench/&&/N4/' to rerun this test only.
+    N8: FAIL
+      1.670 s ±  68 ms, 1.2 GB allocated, 273 MB copied, 853 MB peak memory, 0.83x
+      Use -p '/bench/&&/N8/' to rerun this test only.
+-}
+
 deltaStepping
     :: Bool                             -- Whether to print intermediate states to the console, for debugging purposes
     -> Graph                            -- graph to analyse
@@ -194,31 +210,97 @@ findRequests
     -> TentativeDistances
     -> IO (IntMap Distance)
 findRequests threadCount p graph nodes distances = do
-  -- Start with an empty IntMap to store the requests
-  let initialRequests = IntMap.empty
+  requests <- newMVar IntMap.empty  
+  let splitNodes = splitIntSet threadCount nodes 
 
-  -- Fold over all nodes in the set
-  Set.foldr
-      (\v accIO -> do
-          acc <- accIO
-          tentV <- M.read distances v
+  forkThreads threadCount $ \threadId -> do
+    let nodesI = splitNodes !! threadId
+ 
+    mapM_ (\v -> do
+                tentV <- M.read distances v
 
-          let neighbors = filter (\(_, _, cost) -> p cost) (G.out graph v)
-          let newRequests = map (\(_,w,cost) -> (w, tentV + cost)) neighbors
-          
-          --return $ foldr (uncurry IntMap.insert) acc newRequests
-          return $ foldr insertIfLower acc newRequests
-      )
-      (return initialRequests)
-      nodes 
+                let neighbors = filter (\(_, _, cost) -> p cost) (G.out graph v)
+                    newRequests = map (\(_, w, cost) -> (w, tentV + cost)) neighbors
 
--- Insert only if the new cost is less than the existing one
+                modifyMVar_ requests $ \req -> return (foldr insertIfLower req newRequests))
+              (Set.toList nodesI)
+    
+  readMVar requests
+
+
 insertIfLower :: (Node, Distance) -> IntMap Distance -> IntMap Distance
 insertIfLower (key, newCost) acc =
-    case IntMap.lookup key acc of
-        Just oldCost | oldCost <= newCost -> acc -- Keep the old cost
-        _                                 -> IntMap.insert key newCost acc -- Insert the new cost 
-   
+  case IntMap.lookup key acc of
+      Just oldCost | oldCost <= newCost -> acc -- Keep the old cost
+      _                                 -> IntMap.insert key newCost acc -- Insert the new cost
+
+{-
+-- Split an IntSet into n parts, ensuring sizes differ by at most 1
+splitIntSet :: IntSet -> Int -> [IntSet]
+splitIntSet set n = 
+  let elems = Set.toList set                    -- Convert IntSet to a sorted list
+      (q, r) = length elems `divMod` n          -- q = base size, r = remainder
+      sizes = replicate r (q + 1) ++ replicate (n - r) q -- Sizes for each chunk
+  in map Set.fromList $ splitBySizes sizes elems
+
+-- Helper function to split a list into chunks of specified sizes
+splitBySizes :: [Int] -> [a] -> [[a]]
+splitBySizes [] _ = []
+splitBySizes (s:ss) xs = take s xs : splitBySizes ss (drop s xs)
+-}
+splitIntSet :: Int -> IntSet -> [IntSet]
+splitIntSet threadCount m
+    | threadCount <= 1 = [m]  -- If only one thread, return the entire map
+    | otherwise = take threadCount (go threadCount [m] ++ repeat Set.empty)
+  where
+    -- Recursive splitting of the IntMap
+    go 1 acc = acc  -- Stop splitting when we have enough parts
+    go n acc = go (n - 1) (concatMap Set.splitRoot acc)
+
+{-
+-- Insert only if the new cost is less than the existing one
+insertIfLower2 :: Ord k => (k, Distance) -> CMap k Distance -> STM (CMap k Distance)
+insertIfLower2 (key, newCost) acc = do
+  existingValue <- lookup2 key acc
+  case existingValue of
+      Just oldCost | oldCost <= newCost -> return acc  -- Keep the old cost if it's less than or equal
+      _ -> insert2 key newCost acc  -- Otherwise, insert the new cost
+        
+data CMap k v = CMap (TVar (MapNode k v))
+data MapNode k v
+  = Bin k (TVar v) (CMap k v) (CMap k v)
+  | Tip
+
+lookup2 :: Ord k => k -> CMap k v -> STM (Maybe v)
+lookup2 key (CMap ref) = readTVar ref >>= go
+  where
+    go Tip = return Nothing
+    go (Bin k v l r) =
+      case compare key k of
+      LT -> lookup2 key l
+      GT -> lookup2 key r
+      EQ -> Just <$> readTVar v
+
+insert2 :: Ord k => k -> v -> CMap k v -> STM(CMap k v)
+insert2 key value (CMap ref) = do
+  node <- readTVar ref
+  case node of
+    Tip -> do
+      v <- newTVar value
+      l <- newTVar Tip
+      r <- newTVar Tip
+      writeTVar ref (Bin key v (CMap l) (CMap r))
+      return $ CMap ref
+    (Bin k v l r) -> case compare key k of
+      LT -> insert2 key value l
+      GT -> insert2 key value r
+      EQ -> do
+        -- If key already exists, update the value in the node
+        writeTVar v value
+        return $ CMap ref
+  
+-}
+
 -- Execute requests for each of the given (node, distance) pairs
 --
 relaxRequests
@@ -229,14 +311,27 @@ relaxRequests
     -> IntMap Distance
     -> IO ()
 relaxRequests threadCount buckets distances delta req = do
-  IntMap.foldrWithKey
-      (\node newDistance acc -> do
-          acc
-          relax buckets distances delta (node, newDistance)
-      )
-      (return ()) 
-      req
+  let splitReqs = splitIntMap threadCount req
+
+  forkThreads threadCount $ \threadId -> do
+    IntMap.foldrWithKey
+        (\node newDistance acc -> do
+            acc
+            relax buckets distances delta (node, newDistance)
+        )
+        (return ()) 
+        (splitReqs !! threadId)
     
+-- Function to split an IntMap into n parts (almost equal in size)
+splitIntMap :: Int -> IntMap a -> [IntMap a]
+splitIntMap threadCount m
+    | threadCount <= 1 = [m]  -- If only one thread, return the entire map
+    | otherwise = take threadCount (go threadCount [m] ++ repeat IntMap.empty)
+  where
+    -- Recursive splitting of the IntMap
+    go 1 acc = acc  -- Stop splitting when we have enough parts
+    go n acc = go (n - 1) (concatMap IntMap.splitRoot acc)
+
 
 -- Execute a single relaxation, moving the given node to the appropriate bucket
 -- as necessary
